@@ -39,7 +39,7 @@ def _get_cached_slots():
     return zile_libere
 
 def get_system_prompt():
-    azi = date.today()
+    from pytz import timezone as _tz; azi = datetime.now(_tz("Europe/Bucharest")).date()
     zi = ZILE_RO[azi.strftime("%A")]
     luna = LUNI_RO[azi.strftime("%B")]
     data_azi = f"{zi}, {azi.day} {luna} {azi.year}"
