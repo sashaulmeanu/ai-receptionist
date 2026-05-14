@@ -45,7 +45,7 @@ def get_system_prompt():
     data_azi = f"{zi}, {azi.day} {luna} {azi.year}"
     data_iso = azi.strftime("%Y-%m-%d")
     from datetime import datetime
-    ora = datetime.now().hour
+    import pytz; ora = datetime.now(pytz.timezone("Europe/Bucharest")).hour
     ora_zi = "dimineața" if ora < 12 else "după-amiaza" if ora < 18 else "seara"
     
     from datetime import timedelta
