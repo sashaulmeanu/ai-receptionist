@@ -13,13 +13,9 @@ TIMEZONE = os.getenv("TIMEZONE", "Europe/Bucharest")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 def _get_calendar_service():
-    import base64, json
-    b64 = os.getenv("GOOGLE_CREDENTIALS_B64")
-    if b64:
-        data = json.loads(base64.b64decode(b64).decode())
-        creds = service_account.Credentials.from_service_account_info(data, scopes=SCOPES)
-    else:
-        creds = service_account.Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    creds = service_account.Credentials.from_service_account_file(
+        "credentials.json", scopes=SCOPES
+    )
     return build("calendar", "v3", credentials=creds)
 
 def _get_conn():
