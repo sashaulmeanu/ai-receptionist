@@ -4,7 +4,8 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from calendar_service import book_appointment, get_available_slots, get_free_slots, cancel_appointment, reschedule_appointment
 from sms_service import send_confirmare, send_anulare, send_confirmare as send_reprogramare
-from datetime import date
+from datetime import date, datetime
+import pytz
 import json, re, os
 
 from reminder_service import start_scheduler
@@ -39,13 +40,14 @@ def _get_cached_slots():
     return zile_libere
 
 def get_system_prompt():
-    from pytz import timezone as _tz; azi = datetime.now(_tz("Europe/Bucharest")).date()
+    azi = datetime.now(pytz.timezone("Europe/Bucharest")).date()
     zi = ZILE_RO[azi.strftime("%A")]
     luna = LUNI_RO[azi.strftime("%B")]
     data_azi = f"{zi}, {azi.day} {luna} {azi.year}"
     data_iso = azi.strftime("%Y-%m-%d")
-    from datetime import datetime
-    import pytz; ora = datetime.now(pytz.timezone("Europe/Bucharest")).hour
+    from datetime import date, datetime
+import pytztime
+    ora = datetime.now(pytz.timezone("Europe/Bucharest")).hour
     ora_zi = "dimineața" if ora < 12 else "după-amiaza" if ora < 18 else "seara"
     
     from datetime import timedelta
