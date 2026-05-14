@@ -140,7 +140,7 @@ def get_free_slots(date_str, duration=30):
         end_p = datetime.strptime(f"{date_str} {program[1]}", "%Y-%m-%d %H:%M")
         free = []
         from datetime import datetime
-        import pytz; now = datetime.now(pytz.timezone("Europe/Bucharest"))
+        now = datetime.now(pytz.timezone("Europe/Bucharest"))
         current = start_p
         # Daca e azi, incepe de la ora curenta
         if date_str == now.strftime("%Y-%m-%d"):
