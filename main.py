@@ -45,8 +45,6 @@ def get_system_prompt():
     luna = LUNI_RO[azi.strftime("%B")]
     data_azi = f"{zi}, {azi.day} {luna} {azi.year}"
     data_iso = azi.strftime("%Y-%m-%d")
-    from datetime import date, datetime
-import pytztime
     ora = datetime.now(pytz.timezone("Europe/Bucharest")).hour
     ora_zi = "dimineața" if ora < 12 else "după-amiaza" if ora < 18 else "seara"
     
