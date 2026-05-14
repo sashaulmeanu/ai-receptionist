@@ -31,7 +31,7 @@ def _get_cached_slots():
         return _slots_cache["data"]
     zile_libere = ""
     for i in range(14):
-        ziua = (date.today() + timedelta(days=i)).strftime("%Y-%m-%d")
+        ziua = (datetime.now(pytz.timezone("Europe/Bucharest")).date() + timedelta(days=i)).strftime("%Y-%m-%d")
         sloturi = get_free_slots(ziua, 30)
         if sloturi:
             zile_libere += f"\n{ziua}: {', '.join(sloturi[:6])}"
