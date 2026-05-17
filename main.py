@@ -2,20 +2,67 @@ from fastapi import FastAPI, Form, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from anthropic import Anthropic
 from dotenv import load_dotenv
-from calendar_service import book_appointment, get_available_slots, get_free_slots, cancel_appointment, reschedule_appointment
-from sms_service import send_confirmare, send_anulare, send_confirmare as send_reprogramare
+from calendar_service import (
+    book_appointment,
+    get_available_slots,
+    get_free_slots,
+    cancel_appointment,
+    reschedule_appointment,
+)
+from sms_service import send_confirmare, send_anulare
 from datetime import date
-import json, re, os
+import json
+import re
+import os
+import logging
 
 from reminder_service import start_scheduler
+
+# === Logging ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("sofia")
+
+# === Setup ===
 load_dotenv()
 app = FastAPI()
 scheduler = start_scheduler()
 claude = Anthropic()
 conversations = {}
 
-ZILE_RO = {"Monday":"Luni","Tuesday":"Marți","Wednesday":"Miercuri","Thursday":"Joi","Friday":"Vineri","Saturday":"Sâmbătă","Sunday":"Duminică"}
-LUNI_RO = {"January":"ianuarie","February":"februarie","March":"martie","April":"aprilie","May":"mai","June":"iunie","July":"iulie","August":"august","September":"septembrie","October":"octombrie","November":"noiembrie","December":"decembrie"}
+ZILE_RO = {
+    "Monday": "Luni", "Tuesday": "Marți", "Wednesday": "Miercuri",
+    "Thursday": "Joi", "Friday": "Vineri", "Saturday": "Sâmbătă",
+    "Sunday": "Duminică",
+}
+LUNI_RO = {
+    "January": "ianuarie", "February": "februarie", "March": "martie",
+    "April": "aprilie", "May": "mai", "June": "iunie", "July": "iulie",
+    "August": "august", "September": "septembrie", "October": "octombrie",
+    "November": "noiembrie", "December": "decembrie",
+}
+
+# Durata fixă pe serviciu - Sofia alege singură, NU întreabă clientul
+SERVICE_DURATIONS = {
+    "detartraj": 45,
+    "consultatie": 30, "consultație": 30,
+    "plomba": 60, "plombă": 60,
+    "albire": 60,
+    "extractie": 45, "extracție": 45,
+    "urgenta": 30, "urgență": 30,
+}
+
+
+def infer_duration(service: str) -> int:
+    """Returnează durata în minute pentru un serviciu. Default 30."""
+    s = (service or "").lower().strip()
+    for key, dur in SERVICE_DURATIONS.items():
+        if key in s:
+            return dur
+    return 30
+
 
 def get_system_prompt():
     azi = date.today()
@@ -28,179 +75,300 @@ VORBEȘTI DOAR ÎN ROMÂNĂ. MAX 1-2 propoziții scurte. Fii directă, nu repeta
 DATA DE AZI: {data_azi} ({data_iso})
 
 PROGRAM: Luni-Vineri 08:00-19:00, Sâmbătă 09:00-14:00, Duminică închis
-SERVICII: Detartraj 45min/250RON, Consultație 30min/150RON, Plombă 60min/300-500RON, Albire 60min/800RON, Extracție 45min/200-400RON, Urgență 30min
 
-FLUX - colectează în ordine:
+SERVICII (durata este FIXĂ - NU întreba clientul despre durată):
+- Detartraj: 45min, 250 RON
+- Consultație: 30min, 150 RON
+- Plombă: 60min, 300-500 RON
+- Albire: 60min, 800 RON
+- Extracție: 45min, 200-400 RON
+- Urgență: 30min
+
+FLUX - colectează DOAR aceste 4 informații, în ordine:
 1. Numele complet
 2. Numărul de telefon (07XXXXXXXX)
 3. Serviciul dorit
 4. Data și ora preferată
-5. Durata (30, 45 sau 60 min)
 
-Când ai TOATE datele, termină cu:
-BOOK_APPOINTMENT:{{"name":"Ion Popescu","service":"Detartraj","date":"2026-05-07","time":"10:00","duration":45,"phone":"0712345678"}}
+REGULA CRITICĂ: NU întreba clientul despre durată. Durata o știi tu din lista de servicii.
 
-URGENȚE: empatie + slot același zi.
-Reprogramare - cere: nume, data veche, ora veche, data noua, ora noua. Apoi termină cu:
-RESCHEDULE_APPOINTMENT:{{"name":"Ion Popescu","old_date":"2026-05-07","old_time":"10:00","new_date":"2026-05-08","new_time":"11:00","duration":30}}
+Imediat ce ai cele 4 informații, termină răspunsul cu această linie (FĂRĂ alte cuvinte după ea):
+BOOK_APPOINTMENT:{{"name":"Ion Popescu","service":"Detartraj","date":"2026-05-18","time":"10:00","phone":"0712345678"}}
 
-Anulare programare - cere: nume, data, ora, serviciu. Apoi termină cu:
+URGENȚE: empatie + slot în aceeași zi.
+
+Reprogramare - cere: nume, data veche, ora veche, data nouă, ora nouă. Apoi:
+RESCHEDULE_APPOINTMENT:{{"name":"Ion Popescu","old_date":"2026-05-07","old_time":"10:00","new_date":"2026-05-08","new_time":"11:00"}}
+
+Anulare - cere: nume, data, ora, serviciu. Apoi:
 CANCEL_APPOINTMENT:{{"name":"Ion Popescu","service":"Detartraj","date":"2026-05-07","time":"10:00"}}
 
 Transfer uman: TRANSFER_TO_HUMAN
 Nu te prezenta din nou după primul mesaj. Nu spune "Desigur!" sau "Cu siguranță!"."""
 
-@app.post("/incoming-call")
-async def incoming_call():
+
+# === Helpers TwiML ===
+
+def _twiml_gather(text: str, timeout: int = 5) -> Response:
+    """Răspuns cu Gather - continuă conversația."""
     response = VoiceResponse()
-    gather = Gather(input="speech", action="/handle-speech", timeout=3, speech_timeout="auto", language="ro-RO")
-    gather.say("Clinica Zâmbet Frumos, Sofia. Cu ce vă pot ajuta?", voice="Polly.Carmen")
+    gather = Gather(
+        input="speech",
+        action="/handle-speech",
+        timeout=timeout,
+        speech_timeout="auto",
+        language="ro-RO",
+    )
+    gather.say(text, voice="Polly.Carmen")
     response.append(gather)
     response.say("Vă rugăm sunați din nou. Mulțumim!", voice="Polly.Carmen")
     return Response(content=str(response), media_type="application/xml")
 
+
+def _twiml_say_hangup(text: str) -> Response:
+    """Spune un mesaj final și închide apelul."""
+    response = VoiceResponse()
+    response.say(text, voice="Polly.Carmen")
+    response.hangup()
+    return Response(content=str(response), media_type="application/xml")
+
+
+def _twiml_transfer(text: str) -> Response:
+    """Spune un mesaj și transferă la operator uman."""
+    response = VoiceResponse()
+    if text:
+        response.say(text, voice="Polly.Carmen")
+    response.dial(os.getenv("HUMAN_PHONE_NUMBER", "+40215550100"))
+    return Response(content=str(response), media_type="application/xml")
+
+
+def _extract_json(text: str):
+    """Extrage primul obiect JSON dintr-un text. Returnează dict sau None."""
+    text = text.replace("\n", " ")
+    match = re.search(r"\{[^{}]*\}", text)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group())
+    except json.JSONDecodeError as e:
+        log.warning(f"JSON decode error: {e} | raw: {match.group()!r}")
+        return None
+
+
+def _format_phone(phone: str) -> str:
+    """Formatează un număr de telefon în format E.164 (+40...)."""
+    if not phone:
+        return ""
+    return phone if phone.startswith("+") else "+4" + phone
+
+
+# === Routes ===
+
+@app.post("/incoming-call")
+async def incoming_call():
+    log.info("Apel nou primit")
+    return _twiml_gather("Clinica Zâmbet Frumos, Sofia. Cu ce vă pot ajuta?")
+
+
 @app.post("/handle-speech")
 async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(default="")):
-    response = VoiceResponse()
+    log.info(f"[{CallSid}] USER: {SpeechResult!r}")
 
     if not SpeechResult.strip():
-        gather = Gather(input="speech", action="/handle-speech", timeout=3, speech_timeout="auto", language="ro-RO")
-        gather.say("Nu v-am auzit. Puteți repeta?", voice="Polly.Carmen")
-        response.append(gather)
-        return Response(content=str(response), media_type="application/xml")
+        return _twiml_gather("Nu v-am auzit. Puteți repeta?")
 
     if CallSid not in conversations:
         conversations[CallSid] = []
     conversations[CallSid].append({"role": "user", "content": SpeechResult})
 
-    ai_response = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=150,
-        system=get_system_prompt(),
-        messages=conversations[CallSid]
-    )
-    reply = ai_response.content[0].text
-
-    if "TRANSFER_TO_HUMAN" in reply:
-        spoken = reply.replace("TRANSFER_TO_HUMAN", "").strip()
-        response.say(spoken or "Vă transfer acum.", voice="Polly.Carmen")
-        response.dial(os.getenv("HUMAN_PHONE_NUMBER", "+40215550100"))
+    # === Apel la Claude ===
+    try:
+        ai_response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=get_system_prompt(),
+            messages=conversations[CallSid],
+        )
+        reply = ai_response.content[0].text
+    except Exception as e:
+        log.exception(f"[{CallSid}] Eroare Claude API")
         _cleanup(CallSid)
-        return Response(content=str(response), media_type="application/xml")
+        return _twiml_say_hangup(
+            "Avem o problemă tehnică momentan. Vă rugăm sunați din nou."
+        )
 
+    log.info(f"[{CallSid}] SOFIA: {reply!r}")
+
+    # === Transfer la uman ===
+    if "TRANSFER_TO_HUMAN" in reply:
+        spoken = reply.replace("TRANSFER_TO_HUMAN", "").strip() or "Vă transfer acum."
+        _cleanup(CallSid)
+        return _twiml_transfer(spoken)
+
+    # === Reprogramare ===
     if "RESCHEDULE_APPOINTMENT:" in reply:
-        spoken_part, res_json = reply.split("RESCHEDULE_APPOINTMENT:", 1)
+        spoken_part, res_json_str = reply.split("RESCHEDULE_APPOINTMENT:", 1)
         spoken_part = spoken_part.strip()
+        res = _extract_json(res_json_str)
+
+        if not res:
+            log.warning(f"[{CallSid}] JSON invalid în RESCHEDULE: {res_json_str!r}")
+            _cleanup(CallSid)
+            return _twiml_transfer("Am o problemă cu datele reprogramării. Vă transfer.")
+
         try:
-            res_json = res_json.replace('\n', ' ')
-            json_match = re.search(r'\{[^{}]+\}', res_json)
-            res = json.loads(json_match.group())
+            # La reprogramare nu avem serviciu în JSON - default 60min (safe)
             duration = int(res.get("duration", 60))
-            success, phone = reschedule_appointment(res["name"], res["old_date"], res["old_time"], res["new_date"], res["new_time"], duration)
+            log.info(
+                f"[{CallSid}] Reprogramare: {res['name']} | {res['old_date']} {res['old_time']} -> {res['new_date']} {res['new_time']}"
+            )
+
+            success, phone = reschedule_appointment(
+                res["name"], res["old_date"], res["old_time"],
+                res["new_date"], res["new_time"], duration,
+            )
+
             if success:
                 msg = f"Reprogramarea a fost făcută! Noua programare: {res['new_date']} la ora {res['new_time']}."
-                response.say((spoken_part + " " + msg).strip(), voice="Polly.Carmen")
                 if phone:
-                    tel = phone if phone.startswith("+") else "+4" + phone
-                    send_reprogramare(tel, res["name"], "Reprogramare", res["new_date"], res["new_time"], duration)
+                    try:
+                        send_confirmare(
+                            _format_phone(phone), res["name"], "Reprogramare",
+                            res["new_date"], res["new_time"], duration,
+                        )
+                    except Exception as sms_err:
+                        log.warning(f"[{CallSid}] Eroare SMS reprogramare: {sms_err}")
+                _cleanup(CallSid)
+                return _twiml_say_hangup(f"{spoken_part} {msg} O zi bună!".strip())
+
             elif phone == "ocupat":
                 free = get_free_slots(res["new_date"], duration)
                 optiuni = ", ".join(free[:4]) if free else "nicio oră liberă"
                 msg = f"Ora {res['new_time']} e ocupată. Ore disponibile: {optiuni}."
                 conversations[CallSid].append({"role": "assistant", "content": msg})
-                gather = Gather(input="speech", action="/handle-speech", timeout=6, speech_timeout="auto", language="ro-RO")
-                gather.say(msg, voice="Polly.Carmen")
-                response.append(gather)
-                return Response(content=str(response), media_type="application/xml")
+                return _twiml_gather(msg, timeout=6)
+
             else:
-                response.say("A apărut o problemă cu reprogramarea. Vă transfer.", voice="Polly.Carmen")
-                response.dial(os.getenv("HUMAN_PHONE_NUMBER", "+40215550100"))
-            _cleanup(CallSid)
-        except Exception as e:
-            print(f"[Eroare reprogramare] {e}")
-            response.say("Problemă la reprogramare. Vă transfer.", voice="Polly.Carmen")
-            response.dial(os.getenv("HUMAN_PHONE_NUMBER", "+40215550100"))
-            _cleanup(CallSid)
-        return Response(content=str(response), media_type="application/xml")
+                _cleanup(CallSid)
+                return _twiml_transfer("A apărut o problemă cu reprogramarea. Vă transfer.")
 
+        except Exception:
+            log.exception(f"[{CallSid}] Eroare în reprogramare")
+            _cleanup(CallSid)
+            return _twiml_transfer("Problemă la reprogramare. Vă transfer.")
+
+    # === Anulare ===
     if "CANCEL_APPOINTMENT:" in reply:
-        spoken_part, cancel_json = reply.split("CANCEL_APPOINTMENT:", 1)
+        spoken_part, cancel_json_str = reply.split("CANCEL_APPOINTMENT:", 1)
         spoken_part = spoken_part.strip()
-        try:
-            cancel_json = cancel_json.replace('\n', ' ')
-            json_match = re.search(r'\{[^{}]+\}', cancel_json)
-            cancel = json.loads(json_match.group())
-            phone = cancel_appointment(cancel["name"], cancel["date"], cancel["time"])
-            msg = f"Programarea pentru {cancel.get('service','consultație')} din {cancel['date']} la ora {cancel['time']} a fost anulată."
-            response.say((spoken_part + " " + msg).strip(), voice="Polly.Carmen")
-            response.say("O zi bună!", voice="Polly.Carmen")
-            if phone:
-                tel = phone if phone.startswith("+") else "+4" + phone
-                send_anulare(tel, cancel["name"], cancel.get("service","consultație"), cancel["date"], cancel["time"])
-            _cleanup(CallSid)
-        except Exception as e:
-            print(f"[Eroare anulare] {e}")
-            response.say("A apărut o problemă. Vă transfer la echipă.", voice="Polly.Carmen")
-            response.dial(os.getenv("HUMAN_PHONE_NUMBER", "+40215550100"))
-            _cleanup(CallSid)
-        return Response(content=str(response), media_type="application/xml")
+        cancel = _extract_json(cancel_json_str)
 
-    if "BOOK_APPOINTMENT:" in reply:
-        spoken_part, booking_json = reply.split("BOOK_APPOINTMENT:", 1)
-        spoken_part = spoken_part.strip()
+        if not cancel:
+            log.warning(f"[{CallSid}] JSON invalid în CANCEL: {cancel_json_str!r}")
+            _cleanup(CallSid)
+            return _twiml_transfer("Am o problemă cu datele anulării. Vă transfer.")
+
         try:
-            booking_json = booking_json.replace('\n', ' ')
-            json_match = re.search(r'\{[^{}]+\}', booking_json)
-            booking = json.loads(json_match.group())
-            duration = int(booking.get("duration", 60))
-            if duration not in (30, 45, 60):
-                duration = 60
+            serviciu = cancel.get("service", "consultație")
+            log.info(
+                f"[{CallSid}] Anulare: {cancel['name']} | {serviciu} | {cancel['date']} {cancel['time']}"
+            )
+
+            phone = cancel_appointment(cancel["name"], cancel["date"], cancel["time"])
+            msg = f"Programarea pentru {serviciu} din {cancel['date']} la ora {cancel['time']} a fost anulată."
+
+            if phone:
+                try:
+                    send_anulare(
+                        _format_phone(phone), cancel["name"], serviciu,
+                        cancel["date"], cancel["time"],
+                    )
+                except Exception as sms_err:
+                    log.warning(f"[{CallSid}] Eroare SMS anulare: {sms_err}")
+
+            _cleanup(CallSid)
+            return _twiml_say_hangup(f"{spoken_part} {msg} O zi bună!".strip())
+
+        except Exception:
+            log.exception(f"[{CallSid}] Eroare în anulare")
+            _cleanup(CallSid)
+            return _twiml_transfer("A apărut o problemă. Vă transfer la echipă.")
+
+    # === Programare nouă ===
+    if "BOOK_APPOINTMENT:" in reply:
+        spoken_part, booking_json_str = reply.split("BOOK_APPOINTMENT:", 1)
+        spoken_part = spoken_part.strip()
+        booking = _extract_json(booking_json_str)
+
+        if not booking:
+            log.warning(f"[{CallSid}] JSON invalid în BOOK: {booking_json_str!r}")
+            _cleanup(CallSid)
+            return _twiml_transfer("Am o problemă cu datele programării. Vă transfer.")
+
+        try:
+            service = booking.get("service", "Consultație")
+            # Durata e dedusă din serviciu, NU luată din JSON
+            duration = infer_duration(service)
             phone = booking.get("phone", "")
+
+            log.info(
+                f"[{CallSid}] Booking: {booking['name']} | {service} ({duration}min) | {booking['date']} {booking['time']} | {phone}"
+            )
+
             success = book_appointment(
                 name=booking["name"],
-                service=booking.get("service", "Consultație"),
+                service=service,
                 date=booking["date"],
                 time=booking["time"],
                 duration=duration,
-                phone=phone
+                phone=phone,
             )
+
             if success:
-                confirmare = f"Excelent! Programare confirmată: {booking.get('service')} pe {booking['date']} la {booking['time']}, {duration} minute."
-                response.say((spoken_part + " " + confirmare).strip(), voice="Polly.Carmen")
-                response.say("O zi bună!", voice="Polly.Carmen")
+                confirmare = (
+                    f"Excelent! Programare confirmată: {service} pe "
+                    f"{booking['date']} la {booking['time']}, {duration} minute."
+                )
                 if phone:
-                    tel = phone if phone.startswith("+") else "+4" + phone
-                    send_confirmare(tel, booking["name"], booking.get("service","consultație"), booking["date"], booking["time"], duration)
+                    try:
+                        send_confirmare(
+                            _format_phone(phone), booking["name"], service,
+                            booking["date"], booking["time"], duration,
+                        )
+                    except Exception as sms_err:
+                        log.warning(f"[{CallSid}] Eroare SMS confirmare: {sms_err}")
                 _cleanup(CallSid)
+                return _twiml_say_hangup(f"{spoken_part} {confirmare} O zi bună!".strip())
+
             else:
-                free = get_free_slots(booking['date'], duration)
+                free = get_free_slots(booking["date"], duration)
                 if free:
                     optiuni = ", ".join(free[:4])
-                    msg = f"Ora {booking['time']} este ocupată. Ore disponibile pe {booking['date']}: {optiuni}. Ce preferați?"
+                    msg = (
+                        f"Ora {booking['time']} este ocupată. "
+                        f"Ore disponibile pe {booking['date']}: {optiuni}. Ce preferați?"
+                    )
                 else:
                     msg = f"Ziua de {booking['date']} este complet ocupată. Doriți altă zi?"
                 conversations[CallSid].append({"role": "assistant", "content": msg})
-                gather = Gather(input="speech", action="/handle-speech", timeout=6, speech_timeout="auto", language="ro-RO")
-                gather.say(msg, voice="Polly.Carmen")
-                response.append(gather)
-        except Exception as e:
-            print(f"[Eroare booking] {e}")
-            response.say("A apărut o problemă. Vă transfer la echipă.", voice="Polly.Carmen")
-            response.dial(os.getenv("HUMAN_PHONE_NUMBER", "+40215550100"))
-            _cleanup(CallSid)
-        return Response(content=str(response), media_type="application/xml")
+                return _twiml_gather(msg, timeout=6)
 
+        except Exception:
+            log.exception(f"[{CallSid}] Eroare în booking")
+            _cleanup(CallSid)
+            return _twiml_transfer("A apărut o problemă. Vă transfer la echipă.")
+
+    # === Continuare conversație normală ===
     conversations[CallSid].append({"role": "assistant", "content": reply})
-    gather = Gather(input="speech", action="/handle-speech", timeout=4, speech_timeout="auto", language="ro-RO")
-    gather.say(reply, voice="Polly.Carmen")
-    response.append(gather)
-    response.say("Vă mulțumim. O zi bună!", voice="Polly.Carmen")
-    return Response(content=str(response), media_type="application/xml")
+    return _twiml_gather(reply, timeout=5)
+
 
 @app.post("/call-ended")
 async def call_ended(CallSid: str = Form(...)):
+    log.info(f"[{CallSid}] Call ended")
     _cleanup(CallSid)
     return {"status": "ok"}
+
 
 def _cleanup(call_sid: str):
     conversations.pop(call_sid, None)
