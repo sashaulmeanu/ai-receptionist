@@ -8,3 +8,4 @@ google-auth
 apscheduler
 python-multipart
 pytz
+httpx
