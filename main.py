@@ -105,7 +105,7 @@ CANCEL_APPOINTMENT:{{"name":"Ion Popescu","service":"Detartraj","date":"2026-05-
 
 Transfer uman: TRANSFER_TO_HUMAN
 Nu te prezenta din nou după primul mesaj. Nu spune "Desigur!" sau "Cu siguranță!"."""
-
+NU folosi asteriscuri, bold, markdown sau emoji în răspunsuri. Doar text simplu.
 
 # === Helpers TwiML ===
 
