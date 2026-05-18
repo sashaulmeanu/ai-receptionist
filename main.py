@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Form, Response
+from fastapi import FastAPI, Form, Response, Request
+from fastapi.responses import FileResponse
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -10,6 +11,7 @@ from calendar_service import (
     reschedule_appointment,
 )
 from sms_service import send_confirmare, send_anulare
+from tts_service import generate_audio_async, AUDIO_DIR
 from datetime import date
 import json
 import re
@@ -44,7 +46,6 @@ LUNI_RO = {
     "November": "noiembrie", "December": "decembrie",
 }
 
-# Durata fixă pe serviciu - Sofia alege singură, NU întreabă clientul
 SERVICE_DURATIONS = {
     "detartraj": 45,
     "consultatie": 30, "consultație": 30,
@@ -56,7 +57,6 @@ SERVICE_DURATIONS = {
 
 
 def infer_duration(service: str) -> int:
-    """Returnează durata în minute pentru un serviciu. Default 30."""
     s = (service or "").lower().strip()
     for key, dur in SERVICE_DURATIONS.items():
         if key in s:
@@ -109,8 +109,23 @@ Nu te prezenta din nou după primul mesaj. Nu spune "Desigur!" sau "Cu siguranț
 
 # === Helpers TwiML ===
 
-def _twiml_gather(text: str, timeout: int = 5) -> Response:
-    """Răspuns cu Gather - continuă conversația."""
+def _get_base_url(request: Request) -> str:
+    """Construiește URL-ul public (gestionează ngrok HTTPS -> localhost HTTP)."""
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.url.netloc)
+    return f"{scheme}://{host}"
+
+
+async def _say_or_play(twiml_element, text: str, base_url: str):
+    """Generează audio cu ElevenLabs și îl atașează la TwiML. Fallback la Polly."""
+    audio_filename = await generate_audio_async(text)
+    if audio_filename:
+        twiml_element.play(f"{base_url}/audio/{audio_filename}")
+    else:
+        twiml_element.say(text, voice="Polly.Carmen", language="ro-RO")
+
+
+async def _twiml_gather(text: str, base_url: str, timeout: int = 5) -> Response:
     response = VoiceResponse()
     gather = Gather(
         input="speech",
@@ -119,31 +134,28 @@ def _twiml_gather(text: str, timeout: int = 5) -> Response:
         speech_timeout="auto",
         language="ro-RO",
     )
-    gather.say(text, voice="Polly.Carmen")
+    await _say_or_play(gather, text, base_url)
     response.append(gather)
-    response.say("Vă rugăm sunați din nou. Mulțumim!", voice="Polly.Carmen")
+    await _say_or_play(response, "Vă rugăm sunați din nou. Mulțumim!", base_url)
     return Response(content=str(response), media_type="application/xml")
 
 
-def _twiml_say_hangup(text: str) -> Response:
-    """Spune un mesaj final și închide apelul."""
+async def _twiml_say_hangup(text: str, base_url: str) -> Response:
     response = VoiceResponse()
-    response.say(text, voice="Polly.Carmen")
+    await _say_or_play(response, text, base_url)
     response.hangup()
     return Response(content=str(response), media_type="application/xml")
 
 
-def _twiml_transfer(text: str) -> Response:
-    """Spune un mesaj și transferă la operator uman."""
+async def _twiml_transfer(text: str, base_url: str) -> Response:
     response = VoiceResponse()
     if text:
-        response.say(text, voice="Polly.Carmen")
+        await _say_or_play(response, text, base_url)
     response.dial(os.getenv("HUMAN_PHONE_NUMBER", "+40215550100"))
     return Response(content=str(response), media_type="application/xml")
 
 
 def _extract_json(text: str):
-    """Extrage primul obiect JSON dintr-un text. Returnează dict sau None."""
     text = text.replace("\n", " ")
     match = re.search(r"\{[^{}]*\}", text)
     if not match:
@@ -156,7 +168,6 @@ def _extract_json(text: str):
 
 
 def _format_phone(phone: str) -> str:
-    """Formatează un număr de telefon în format E.164 (+40...)."""
     if not phone:
         return ""
     return phone if phone.startswith("+") else "+4" + phone
@@ -164,18 +175,38 @@ def _format_phone(phone: str) -> str:
 
 # === Routes ===
 
+@app.get("/audio/{filename}")
+async def serve_audio(filename: str):
+    """Servește fișierele audio generate de ElevenLabs către Twilio."""
+    if not filename.endswith(".mp3") or "/" in filename or ".." in filename:
+        return Response(status_code=404)
+    filepath = AUDIO_DIR / filename
+    if not filepath.exists():
+        return Response(status_code=404)
+    return FileResponse(filepath, media_type="audio/mpeg")
+
+
 @app.post("/incoming-call")
-async def incoming_call():
+async def incoming_call(request: Request):
     log.info("Apel nou primit")
-    return _twiml_gather("Clinica Zâmbet Frumos, Sofia. Cu ce vă pot ajuta?")
+    base_url = _get_base_url(request)
+    return await _twiml_gather(
+        "Clinica Zâmbet Frumos, Sofia. Cu ce vă pot ajuta?",
+        base_url,
+    )
 
 
 @app.post("/handle-speech")
-async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(default="")):
+async def handle_speech(
+    request: Request,
+    CallSid: str = Form(...),
+    SpeechResult: str = Form(default=""),
+):
+    base_url = _get_base_url(request)
     log.info(f"[{CallSid}] USER: {SpeechResult!r}")
 
     if not SpeechResult.strip():
-        return _twiml_gather("Nu v-am auzit. Puteți repeta?")
+        return await _twiml_gather("Nu v-am auzit. Puteți repeta?", base_url)
 
     if CallSid not in conversations:
         conversations[CallSid] = []
@@ -190,11 +221,12 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
             messages=conversations[CallSid],
         )
         reply = ai_response.content[0].text
-    except Exception as e:
+    except Exception:
         log.exception(f"[{CallSid}] Eroare Claude API")
         _cleanup(CallSid)
-        return _twiml_say_hangup(
-            "Avem o problemă tehnică momentan. Vă rugăm sunați din nou."
+        return await _twiml_say_hangup(
+            "Avem o problemă tehnică momentan. Vă rugăm sunați din nou.",
+            base_url,
         )
 
     log.info(f"[{CallSid}] SOFIA: {reply!r}")
@@ -203,7 +235,7 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
     if "TRANSFER_TO_HUMAN" in reply:
         spoken = reply.replace("TRANSFER_TO_HUMAN", "").strip() or "Vă transfer acum."
         _cleanup(CallSid)
-        return _twiml_transfer(spoken)
+        return await _twiml_transfer(spoken, base_url)
 
     # === Reprogramare ===
     if "RESCHEDULE_APPOINTMENT:" in reply:
@@ -214,10 +246,9 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
         if not res:
             log.warning(f"[{CallSid}] JSON invalid în RESCHEDULE: {res_json_str!r}")
             _cleanup(CallSid)
-            return _twiml_transfer("Am o problemă cu datele reprogramării. Vă transfer.")
+            return await _twiml_transfer("Am o problemă cu datele reprogramării. Vă transfer.", base_url)
 
         try:
-            # La reprogramare nu avem serviciu în JSON - default 60min (safe)
             duration = int(res.get("duration", 60))
             log.info(
                 f"[{CallSid}] Reprogramare: {res['name']} | {res['old_date']} {res['old_time']} -> {res['new_date']} {res['new_time']}"
@@ -239,23 +270,23 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
                     except Exception as sms_err:
                         log.warning(f"[{CallSid}] Eroare SMS reprogramare: {sms_err}")
                 _cleanup(CallSid)
-                return _twiml_say_hangup(f"{spoken_part} {msg} O zi bună!".strip())
+                return await _twiml_say_hangup(f"{spoken_part} {msg} O zi bună!".strip(), base_url)
 
             elif phone == "ocupat":
                 free = get_free_slots(res["new_date"], duration)
                 optiuni = ", ".join(free[:4]) if free else "nicio oră liberă"
                 msg = f"Ora {res['new_time']} e ocupată. Ore disponibile: {optiuni}."
                 conversations[CallSid].append({"role": "assistant", "content": msg})
-                return _twiml_gather(msg, timeout=6)
+                return await _twiml_gather(msg, base_url, timeout=6)
 
             else:
                 _cleanup(CallSid)
-                return _twiml_transfer("A apărut o problemă cu reprogramarea. Vă transfer.")
+                return await _twiml_transfer("A apărut o problemă cu reprogramarea. Vă transfer.", base_url)
 
         except Exception:
             log.exception(f"[{CallSid}] Eroare în reprogramare")
             _cleanup(CallSid)
-            return _twiml_transfer("Problemă la reprogramare. Vă transfer.")
+            return await _twiml_transfer("Problemă la reprogramare. Vă transfer.", base_url)
 
     # === Anulare ===
     if "CANCEL_APPOINTMENT:" in reply:
@@ -266,7 +297,7 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
         if not cancel:
             log.warning(f"[{CallSid}] JSON invalid în CANCEL: {cancel_json_str!r}")
             _cleanup(CallSid)
-            return _twiml_transfer("Am o problemă cu datele anulării. Vă transfer.")
+            return await _twiml_transfer("Am o problemă cu datele anulării. Vă transfer.", base_url)
 
         try:
             serviciu = cancel.get("service", "consultație")
@@ -287,12 +318,12 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
                     log.warning(f"[{CallSid}] Eroare SMS anulare: {sms_err}")
 
             _cleanup(CallSid)
-            return _twiml_say_hangup(f"{spoken_part} {msg} O zi bună!".strip())
+            return await _twiml_say_hangup(f"{spoken_part} {msg} O zi bună!".strip(), base_url)
 
         except Exception:
             log.exception(f"[{CallSid}] Eroare în anulare")
             _cleanup(CallSid)
-            return _twiml_transfer("A apărut o problemă. Vă transfer la echipă.")
+            return await _twiml_transfer("A apărut o problemă. Vă transfer la echipă.", base_url)
 
     # === Programare nouă ===
     if "BOOK_APPOINTMENT:" in reply:
@@ -303,11 +334,10 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
         if not booking:
             log.warning(f"[{CallSid}] JSON invalid în BOOK: {booking_json_str!r}")
             _cleanup(CallSid)
-            return _twiml_transfer("Am o problemă cu datele programării. Vă transfer.")
+            return await _twiml_transfer("Am o problemă cu datele programării. Vă transfer.", base_url)
 
         try:
             service = booking.get("service", "Consultație")
-            # Durata e dedusă din serviciu, NU luată din JSON
             duration = infer_duration(service)
             phone = booking.get("phone", "")
 
@@ -338,7 +368,7 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
                     except Exception as sms_err:
                         log.warning(f"[{CallSid}] Eroare SMS confirmare: {sms_err}")
                 _cleanup(CallSid)
-                return _twiml_say_hangup(f"{spoken_part} {confirmare} O zi bună!".strip())
+                return await _twiml_say_hangup(f"{spoken_part} {confirmare} O zi bună!".strip(), base_url)
 
             else:
                 free = get_free_slots(booking["date"], duration)
@@ -351,16 +381,16 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
                 else:
                     msg = f"Ziua de {booking['date']} este complet ocupată. Doriți altă zi?"
                 conversations[CallSid].append({"role": "assistant", "content": msg})
-                return _twiml_gather(msg, timeout=6)
+                return await _twiml_gather(msg, base_url, timeout=6)
 
         except Exception:
             log.exception(f"[{CallSid}] Eroare în booking")
             _cleanup(CallSid)
-            return _twiml_transfer("A apărut o problemă. Vă transfer la echipă.")
+            return await _twiml_transfer("A apărut o problemă. Vă transfer la echipă.", base_url)
 
     # === Continuare conversație normală ===
     conversations[CallSid].append({"role": "assistant", "content": reply})
-    return _twiml_gather(reply, timeout=5)
+    return await _twiml_gather(reply, base_url, timeout=5)
 
 
 @app.post("/call-ended")
