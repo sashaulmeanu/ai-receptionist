@@ -118,15 +118,15 @@ def _twiml_gather(text: str, timeout: int = 5) -> Response:
         speech_timeout="auto",
         language="ro-RO",
     )
-    gather.say(text, voice="Polly.Carmen")
+    gather.say(text, voice="Google.ro-RO-Wavenet-A")
     response.append(gather)
-    response.say("Vă rugăm sunați din nou. Mulțumim!", voice="Polly.Carmen")
+    response.say("Vă rugăm sunați din nou. Mulțumim!", voice="Google.ro-RO-Wavenet-A")
     return Response(content=str(response), media_type="application/xml")
 
 
 def _twiml_say_hangup(text: str) -> Response:
     response = VoiceResponse()
-    response.say(text, voice="Polly.Carmen")
+    response.say(text, voice="Google.ro-RO-Wavenet-A")
     response.hangup()
     return Response(content=str(response), media_type="application/xml")
 
@@ -134,7 +134,7 @@ def _twiml_say_hangup(text: str) -> Response:
 def _twiml_transfer(text: str) -> Response:
     response = VoiceResponse()
     if text:
-        response.say(text, voice="Polly.Carmen")
+        response.say(text, voice="Google.ro-RO-Wavenet-A")
     response.dial(os.getenv("HUMAN_PHONE_NUMBER", "+40215550100"))
     return Response(content=str(response), media_type="application/xml")
 
