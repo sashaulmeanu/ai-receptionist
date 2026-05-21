@@ -44,7 +44,6 @@ LUNI_RO = {
     "November": "noiembrie", "December": "decembrie",
 }
 
-# Durata fixă pe serviciu - Sofia alege singură, NU întreabă clientul
 SERVICE_DURATIONS = {
     "detartraj": 45,
     "consultatie": 30, "consultație": 30,
@@ -56,7 +55,6 @@ SERVICE_DURATIONS = {
 
 
 def infer_duration(service: str) -> int:
-    """Returnează durata în minute pentru un serviciu. Default 30."""
     s = (service or "").lower().strip()
     for key, dur in SERVICE_DURATIONS.items():
         if key in s:
@@ -73,6 +71,8 @@ def get_system_prompt():
     return f"""Ești Sofia, recepționista AI a Clinicii Stomatologice Zâmbet Frumos din București.
 VORBEȘTI DOAR ÎN ROMÂNĂ. MAX 1-2 propoziții scurte. Fii directă, nu repeta informații.
 DATA DE AZI: {data_azi} ({data_iso})
+
+REGULĂ DE FORMATARE: NU folosi asteriscuri, bold, markdown sau emoji în răspunsuri. Doar text simplu, conversațional. Răspunsurile tale sunt citite cu voce tare de TTS.
 
 PROGRAM: Luni-Vineri 08:00-19:00, Sâmbătă 09:00-14:00, Duminică închis
 
@@ -92,25 +92,24 @@ FLUX - colectează DOAR aceste 4 informații, în ordine:
 
 REGULA CRITICĂ: NU întreba clientul despre durată. Durata o știi tu din lista de servicii.
 
-Imediat ce ai cele 4 informații, termină răspunsul cu această linie (FĂRĂ alte cuvinte după ea):
+Imediat ce ai cele 4 informații, termină răspunsul cu această linie:
 BOOK_APPOINTMENT:{{"name":"Ion Popescu","service":"Detartraj","date":"2026-05-18","time":"10:00","phone":"0712345678"}}
 
 URGENȚE: empatie + slot în aceeași zi.
 
-Reprogramare - cere: nume, data veche, ora veche, data nouă, ora nouă. Apoi:
+Reprogramare:
 RESCHEDULE_APPOINTMENT:{{"name":"Ion Popescu","old_date":"2026-05-07","old_time":"10:00","new_date":"2026-05-08","new_time":"11:00"}}
 
-Anulare - cere: nume, data, ora, serviciu. Apoi:
+Anulare:
 CANCEL_APPOINTMENT:{{"name":"Ion Popescu","service":"Detartraj","date":"2026-05-07","time":"10:00"}}
 
 Transfer uman: TRANSFER_TO_HUMAN
-Nu te prezenta din nou după primul mesaj. Nu spune "Desigur!" sau "Cu siguranță!"."""
-NU folosi asteriscuri, bold, markdown sau emoji în răspunsuri. Doar text simplu.
+Nu te prezenta din nou după primul mesaj. Nu spune Desigur sau Cu siguranță."""
+
 
 # === Helpers TwiML ===
 
 def _twiml_gather(text: str, timeout: int = 5) -> Response:
-    """Răspuns cu Gather - continuă conversația."""
     response = VoiceResponse()
     gather = Gather(
         input="speech",
@@ -119,31 +118,38 @@ def _twiml_gather(text: str, timeout: int = 5) -> Response:
         speech_timeout="auto",
         language="ro-RO",
     )
-    gather.say(text, voice="Google.ro-RO-Wavenet-A")
+    gather.say(text, voice="Polly.Carmen")
     response.append(gather)
-    response.say("Vă rugăm sunați din nou. Mulțumim!", voice="Google.ro-RO-Wavenet-A")
+    response.say("Vă rugăm sunați din nou. Mulțumim!", voice="Polly.Carmen")
     return Response(content=str(response), media_type="application/xml")
 
 
 def _twiml_say_hangup(text: str) -> Response:
-    """Spune un mesaj final și închide apelul."""
     response = VoiceResponse()
-    response.say(text, voice="Google.ro-RO-Wavenet-A")
+    response.say(text, voice="Polly.Carmen")
     response.hangup()
     return Response(content=str(response), media_type="application/xml")
 
 
 def _twiml_transfer(text: str) -> Response:
-    """Spune un mesaj și transferă la operator uman."""
     response = VoiceResponse()
     if text:
-        response.say(text, voice="Google.ro-RO-Wavenet-A")
+        response.say(text, voice="Polly.Carmen")
     response.dial(os.getenv("HUMAN_PHONE_NUMBER", "+40215550100"))
     return Response(content=str(response), media_type="application/xml")
 
 
+def _strip_formatting(text: str) -> str:
+    """Curăță asteriscuri și markdown din text înainte de TTS."""
+    if not text:
+        return text
+    text = re.sub(r"[*_]+", "", text)
+    text = re.sub(r"`+", "", text)
+    text = re.sub(r"#+\s*", "", text)
+    return text.strip()
+
+
 def _extract_json(text: str):
-    """Extrage primul obiect JSON dintr-un text. Returnează dict sau None."""
     text = text.replace("\n", " ")
     match = re.search(r"\{[^{}]*\}", text)
     if not match:
@@ -156,7 +162,6 @@ def _extract_json(text: str):
 
 
 def _format_phone(phone: str) -> str:
-    """Formatează un număr de telefon în format E.164 (+40...)."""
     if not phone:
         return ""
     return phone if phone.startswith("+") else "+4" + phone
@@ -181,7 +186,6 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
         conversations[CallSid] = []
     conversations[CallSid].append({"role": "user", "content": SpeechResult})
 
-    # === Apel la Claude ===
     try:
         ai_response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -190,7 +194,7 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
             messages=conversations[CallSid],
         )
         reply = ai_response.content[0].text
-    except Exception as e:
+    except Exception:
         log.exception(f"[{CallSid}] Eroare Claude API")
         _cleanup(CallSid)
         return _twiml_say_hangup(
@@ -199,16 +203,14 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
 
     log.info(f"[{CallSid}] SOFIA: {reply!r}")
 
-    # === Transfer la uman ===
     if "TRANSFER_TO_HUMAN" in reply:
-        spoken = reply.replace("TRANSFER_TO_HUMAN", "").strip() or "Vă transfer acum."
+        spoken = _strip_formatting(reply.replace("TRANSFER_TO_HUMAN", "").strip()) or "Vă transfer acum."
         _cleanup(CallSid)
         return _twiml_transfer(spoken)
 
-    # === Reprogramare ===
     if "RESCHEDULE_APPOINTMENT:" in reply:
         spoken_part, res_json_str = reply.split("RESCHEDULE_APPOINTMENT:", 1)
-        spoken_part = spoken_part.strip()
+        spoken_part = _strip_formatting(spoken_part.strip())
         res = _extract_json(res_json_str)
 
         if not res:
@@ -217,7 +219,6 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
             return _twiml_transfer("Am o problemă cu datele reprogramării. Vă transfer.")
 
         try:
-            # La reprogramare nu avem serviciu în JSON - default 60min (safe)
             duration = int(res.get("duration", 60))
             log.info(
                 f"[{CallSid}] Reprogramare: {res['name']} | {res['old_date']} {res['old_time']} -> {res['new_date']} {res['new_time']}"
@@ -229,7 +230,7 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
             )
 
             if success:
-                msg = f"Reprogramarea a fost făcută! Noua programare: {res['new_date']} la ora {res['new_time']}."
+                msg = f"Reprogramarea a fost făcută. Noua programare: {res['new_date']} la ora {res['new_time']}."
                 if phone:
                     try:
                         send_confirmare(
@@ -257,10 +258,9 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
             _cleanup(CallSid)
             return _twiml_transfer("Problemă la reprogramare. Vă transfer.")
 
-    # === Anulare ===
     if "CANCEL_APPOINTMENT:" in reply:
         spoken_part, cancel_json_str = reply.split("CANCEL_APPOINTMENT:", 1)
-        spoken_part = spoken_part.strip()
+        spoken_part = _strip_formatting(spoken_part.strip())
         cancel = _extract_json(cancel_json_str)
 
         if not cancel:
@@ -294,10 +294,9 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
             _cleanup(CallSid)
             return _twiml_transfer("A apărut o problemă. Vă transfer la echipă.")
 
-    # === Programare nouă ===
     if "BOOK_APPOINTMENT:" in reply:
         spoken_part, booking_json_str = reply.split("BOOK_APPOINTMENT:", 1)
-        spoken_part = spoken_part.strip()
+        spoken_part = _strip_formatting(spoken_part.strip())
         booking = _extract_json(booking_json_str)
 
         if not booking:
@@ -307,7 +306,6 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
 
         try:
             service = booking.get("service", "Consultație")
-            # Durata e dedusă din serviciu, NU luată din JSON
             duration = infer_duration(service)
             phone = booking.get("phone", "")
 
@@ -326,7 +324,7 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
 
             if success:
                 confirmare = (
-                    f"Excelent! Programare confirmată: {service} pe "
+                    f"Excelent. Programare confirmată: {service} pe "
                     f"{booking['date']} la {booking['time']}, {duration} minute."
                 )
                 if phone:
@@ -358,9 +356,9 @@ async def handle_speech(CallSid: str = Form(...), SpeechResult: str = Form(defau
             _cleanup(CallSid)
             return _twiml_transfer("A apărut o problemă. Vă transfer la echipă.")
 
-    # === Continuare conversație normală ===
+    clean_reply = _strip_formatting(reply)
     conversations[CallSid].append({"role": "assistant", "content": reply})
-    return _twiml_gather(reply, timeout=5)
+    return _twiml_gather(clean_reply, timeout=5)
 
 
 @app.post("/call-ended")
